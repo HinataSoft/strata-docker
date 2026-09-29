@@ -6,6 +6,7 @@
 #               write the run config.  Needs /data mounted READ-WRITE.
 #   serve       (default) run the server against the config init wrote.  /data may be read-only.
 #   calibrate   measure this machine's engine settings (5-10 min) and save them into the config.
+#   preflight   check that the binaries and model files can actually start, with errors visible
 #   <anything>  executed as given (e.g. `bash`, `python chat.py`).
 #
 # Which config is active is NOT recomputed here - init records it in $STRATA_CONFIG_DIR/active and serve
@@ -73,6 +74,19 @@ check_cgroup_memory() {
     done
 }
 
+# The API key, from STRATA_API_KEY_FILE (a docker secret, preferred) or STRATA_API_KEY.  Empty = no key,
+# which is the default: the server then serves /v1/* to anyone who can reach the port.
+resolve_api_key() {
+    if [ -n "${STRATA_API_KEY_FILE:-}" ]; then
+        [ -r "$STRATA_API_KEY_FILE" ] || die \
+            "STRATA_API_KEY_FILE is set but $STRATA_API_KEY_FILE cannot be read" \
+            "With docker secrets the file appears at /run/secrets/<name>."
+        head -n 1 "$STRATA_API_KEY_FILE" | tr -d '\r\n'
+        return 0
+    fi
+    printf '%s' "${STRATA_API_KEY:-}"
+}
+
 resolve_config() {
     if [ -n "${STRATA_CONFIG:-}" ]; then
         printf '%s' "$STRATA_CONFIG"
@@ -106,6 +120,17 @@ cmd_init() {
         --port "$STRATA_PORT"
     [ -n "${STRATA_GPU:-}" ] && set -- "$@" --gpu "$STRATA_GPU"
     [ -n "${STRATA_GGUF_DIR:-}" ] && set -- "$@" --gguf-dir "$STRATA_GGUF_DIR"
+    # written into the config, so the running server needs no key on its command line (where the host's
+    # `ps` would show it).  serve can still override it per start.
+    # `|| exit` matters: resolve_api_key runs in a subshell, so its die() would otherwise only end that
+    # subshell and init would carry on with no key - silently unauthenticated.
+    api_key=$(resolve_api_key) || exit 1
+    if [ -n "$api_key" ]; then
+        set -- "$@" --api-key "$api_key"
+        note "API key: required (stored in the config)"
+    else
+        note "API key: none - anyone who can reach the port can use the model"
+    fi
 
     cd "$ROOT"
     "$PYTHON" setup.py "$@"
@@ -134,6 +159,10 @@ cmd_serve() {
     cd "$ROOT"
     set -- serve/server.py --engine strata --config "$cfg" --host "$STRATA_HOST" --port "$STRATA_PORT"
     [ -n "${STRATA_GPU:-}" ] && set -- "$@" --gpu "$STRATA_GPU"
+    # Only when the environment sets one: it overrides whatever init wrote into the config, which is how a
+    # key gets rotated without re-running init.  Otherwise the config's own key (if any) applies.
+    api_key=$(resolve_api_key) || exit 1
+    [ -n "$api_key" ] && set -- "$@" --api-key "$api_key"
     note "Starting Strata on $STRATA_HOST:$STRATA_PORT"
     note "config: $cfg"
     note "Loading the experts into RAM takes 1-3 minutes; the health check allows for it."
@@ -156,9 +185,17 @@ cmd_calibrate() {
     note "calibration saved to $cfg and to $XDG_CONFIG_HOME/strata/settings.json"
 }
 
+cmd_preflight() {
+    cfg=$(resolve_config) || die "no active config - run init first"
+    check_memlock
+    cd "$ROOT"
+    exec "$PYTHON" "$ROOT/docker/preflight.py" "$cfg"
+}
+
 case "${1:-serve}" in
     init)      shift; cmd_init "$@" ;;
     serve)     shift; cmd_serve "$@" ;;
     calibrate) shift; cmd_calibrate "$@" ;;
+    preflight) shift; cmd_preflight "$@" ;;
     *)         exec "$@" ;;
 esac

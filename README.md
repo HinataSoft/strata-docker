@@ -181,7 +181,8 @@ print(client.chat.completions.create(
     model="strata", messages=[{"role": "user", "content": "Hello!"}]).choices[0].message.content)
 ```
 
-Any API key string is accepted — none is configured. Thinking effort is per request:
+Any API key string is accepted, because none is configured by default — see §7 to require one. Thinking
+effort is per request:
 `"reasoning_effort": "none" | "low" | "medium" | "high"` on the OpenAI side, `"output_config": {"effort": ...}`
 on the Anthropic side. The default is `high`.
 
@@ -197,7 +198,19 @@ docker compose logs -f strata          # follow the log
 docker compose ps                      # health
 ```
 
-The engine's own stderr goes to `<config volume>/strata-<tag>.log`.
+The engine's own stderr goes to `<config volume>/strata-<tag>.log` — **look there first when the server dies
+at startup**, because the engine's and the vision encoder's real errors never reach the console.
+
+### When it will not start
+
+```bash
+docker compose stop strata                  # first: stop the restart loop flooding the log
+tail -50 <config volume>/strata-<tag>.log   # the actual error
+docker compose run --rm strata preflight    # binaries, libraries, model files, encoder startup
+```
+
+`preflight` reproduces exactly what the server does at startup — same config, same `LD_LIBRARY_PATH` — but
+with stderr visible instead of redirected into the log.
 
 ### Optional: tune for this machine
 
@@ -217,7 +230,7 @@ docker compose run --rm strata bash
 docker compose run --rm strata python chat.py      # terminal chat
 ```
 
-Any command that is not `init`, `serve` or `calibrate` is executed as given.
+Any command that is not `init`, `serve`, `calibrate` or `preflight` is executed as given.
 
 ---
 
@@ -276,6 +289,48 @@ The "value" column is what `.env.example` ships. Compose supplies a fallback for
 | `STRATA_BIND` | `127.0.0.1` | The **host** address the port is published on |
 | `STRATA_GPU_DEVICE` | `0` | An index or a `GPU-<uuid>` from `nvidia-smi -L` |
 | `STRATA_CONFIG` | — | Override which config `serve` uses, instead of `/config/active` |
+| `STRATA_API_KEY` | empty | Empty = no key, `/v1/*` open to anyone who can reach the port. See below |
+| `STRATA_API_KEY_FILE` | — | Read the key from a file instead (a docker secret). Preferred over the above |
+
+### Requiring an API key
+
+Off by default, which is why `STRATA_BIND` matters. To turn it on, set `STRATA_API_KEY` in `.env` and run
+`init` (fast — nothing is downloaded again), then restart:
+
+```bash
+docker compose --profile init run --rm strata-init   # with /data writable
+docker compose up -d strata
+```
+
+The server then requires the key on `/v1/*` as either header; `/health`, `/status` and the chat page stay
+open:
+
+```bash
+curl http://192.168.1.10:8080/v1/models -H "Authorization: Bearer <key>"
+curl http://192.168.1.10:8080/v1/models -H "x-api-key: <key>"
+```
+
+`init` writes the key **into the config**, so the running server does not carry it on its command line —
+the host's `ps` shows a container's arguments, and a key there would be readable by any user on the machine.
+Setting `STRATA_API_KEY` also applies at `serve`, where it overrides the stored key: that is how to rotate
+one with a restart instead of another `init`.
+
+For anything beyond a home LAN, prefer `STRATA_API_KEY_FILE` with a docker secret — an environment variable
+is visible in `docker inspect`:
+
+```yaml
+secrets:
+  strata_api_key:
+    file: ./secret-api-key
+services:
+  strata:
+    secrets: [strata_api_key]
+    environment:
+      STRATA_API_KEY_FILE: /run/secrets/strata_api_key
+```
+
+To remove a key: clear `STRATA_API_KEY`, re-run `init` (or delete `"api_key"` from the config by hand), and
+restart. Clearing the variable alone is not enough, because the stored key still applies.
 
 ---
 
@@ -349,6 +404,17 @@ running `docker run` by hand, add it. Without it the engine cannot pin its 50 GB
 **The container is OOM-killed while loading** — a container memory limit is set. `setup.py` reads
 `/proc/meminfo`, which reports the *host's* RAM, so it cannot see the limit and will not warn you. The
 entrypoint checks cgroups and warns, but the fix is to remove the limit.
+
+**`the vision encoder did not start:` with nothing after the colon** — `strata-vision` died before printing
+anything on stdout. `server.py` sends its stderr to the engine log, so the real error is in
+`<config volume>/strata-<tag>.log`, not on the console. Almost always a missing shared library. The build
+now collects the CUDA libraries the binaries link against (including `libnccl.so.2`, which ggml-cuda needs
+and NVIDIA's pip wheels do not ship) and the smoke test fails the build if any of them would be missing —
+but if you hit it, run the preflight, which reproduces that startup with stderr visible:
+
+```bash
+docker compose run --rm strata preflight
+```
 
 **`Illegal instruction` / SIGILL at startup** — the image was built with `STRATA_PORTABLE=OFF` on a different
 CPU than it runs on. Rebuild with `STRATA_PORTABLE=ON`.
@@ -424,7 +490,8 @@ docker-compose.yml      strata-init (profile) · strata · strata-calibrate (pro
 .env.example            every setting
 strata.dockerignore     filters the Strata context — BuildKit looks for it here, not in the checkout
 docker/
-  entrypoint.sh         init | serve | calibrate | <anything>
+  entrypoint.sh         init | serve | calibrate | preflight | <anything>
+  preflight.py          startup check with stderr visible (what server.py hides in the log)
   write_build_json.py   makes setup.py adopt the compiled engine
   write_pip_stamp.py    makes setup.py skip its pip step
   patch_config.py       moves the config to /config, adds the cache flags, records the active one

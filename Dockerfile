@@ -34,6 +34,10 @@ ARG CUDA_ARCHITECTURES=120
 #       it - anywhere else the engine dies with SIGILL.  Safe when you build on the target machine.
 #       Strata's own expert kernels are per-file with a run-time check either way, so ON costs little.
 ARG STRATA_PORTABLE=ON
+# Whether the vision encoder is built with CUDA.  ON links it against ggml-cuda, so it needs the CUDA
+# runtime libraries even when it is told to run on the CPU (STRATA_VISION=cpu).  Set OFF for a CPU-only
+# encoder with no CUDA dependency at all.
+ARG STRATA_VISION_CUDA=ON
 # the commit setup.py pins (its LLAMA_CPP_COMMIT).  Verified against the Strata tree by the smoke test.
 ARG LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d
 
@@ -69,7 +73,7 @@ RUN cmake -G Ninja -S . -B build \
 RUN cmake -G Ninja -S tools/vision -B build-vision \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLAMA_DIR=/opt/strata/third_party/llama.cpp \
-        -DSTRATA_VISION_CUDA=ON \
+        -DSTRATA_VISION_CUDA=${STRATA_VISION_CUDA} \
         -DSTRATA_PORTABLE=${STRATA_PORTABLE} \
         -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
         -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
@@ -86,6 +90,18 @@ RUN mkdir -p engine \
     && chmod 0755 engine/strata engine/strata-vision \
     && python3 docker/write_build_json.py "${CUDA_ARCHITECTURES}" \
     && cat engine/BUILD.json
+
+# The CUDA libraries the binaries actually link against, collected from the toolkit by asking ldd rather than
+# by guessing pip package names.  NVIDIA's pip wheels cover cuBLAS and the CUDA runtime, but ggml-cuda also
+# pulls in libnccl, which has no wheel in that set - without it the binary dies at exec with
+# "error while loading shared libraries: libnccl.so.2", before it can print anything.
+# libcuda.so.1 is deliberately excluded: that one comes from the host driver via nvidia-container-toolkit.
+RUN mkdir -p /opt/cudalibs \
+    && { ldd engine/strata; ldd engine/strata-vision; } \
+       | awk '/=> \//{print $3}' | sort -u \
+       | grep -E '/lib(nccl|cublas|cublasLt|cudart|cufft|curand|cusparse|cusolver|nvrtc|nvJitLink|nvToolsExt)\.' \
+       | xargs -r -I{} cp -Lv {} /opt/cudalibs/ \
+    && ls -1 /opt/cudalibs
 
 # ---------------------------------------------------------------------------------------------- runtime
 # Ubuntu 24.04, matching the builder: a binary linked against glibc 2.39 will not start on Debian bookworm.
@@ -119,6 +135,13 @@ RUN python3 -m venv /opt/venv \
 WORKDIR /opt/strata
 
 COPY --from=builder /opt/strata/engine/ engine/
+
+# The toolkit libraries the binaries link against but the pip wheels above do not ship (libnccl in
+# particular).  These go through ldconfig rather than LD_LIBRARY_PATH on purpose: the config's lib_dirs
+# (the pip wheels) are put on LD_LIBRARY_PATH by server.py's child_env() and therefore still win, so this
+# is a fallback for what the wheels do not cover, not a second copy that shadows them.
+COPY --from=builder /opt/cudalibs/ /opt/cudalibs/
+RUN echo /opt/cudalibs > /etc/ld.so.conf.d/strata-cuda.conf && ldconfig
 # gguf-py is what the pack and MTP tools import (STRATA_GGUF_PY); ggml/CMakeLists.txt is the marker that stops
 # get_llama_cpp() from downloading the llama.cpp source again at init time.
 COPY --from=builder /opt/strata/third_party/llama.cpp/gguf-py/ third_party/llama.cpp/gguf-py/

@@ -30,6 +30,9 @@ x-strata-common: &strata-common
       # OFF = ggml built with -march=native.  Better tuning for this exact CPU, but the image then ONLY runs
       #       on it - anywhere else the engine dies with SIGILL.  Safe when you build on the target machine.
       STRATA_PORTABLE: "${STRATA_PORTABLE:-ON}"
+      # ON links the vision encoder against ggml-cuda, so it needs the CUDA runtime even when told
+      # to run on the CPU.  OFF gives a CPU-only encoder with no CUDA dependency.
+      STRATA_VISION_CUDA: "${STRATA_VISION_CUDA:-ON}"
       # recorded on the image as org.strata.source-ref, so a running container says what it was built from
       STRATA_REF: "${STRATA_SRC}"
   environment:
@@ -41,6 +44,12 @@ x-strata-common: &strata-common
     STRATA_PORT: "${STRATA_PORT:-8080}"
     STRATA_PROMPT_CACHE: "${STRATA_PROMPT_CACHE:-24}"
     STRATA_PROMPT_CACHE_EVERY: "${STRATA_PROMPT_CACHE_EVERY:-8192}"
+    # Empty = no key, and /v1/* is open to anyone who can reach the port.  init writes the key into
+    # the config; setting it here as well lets serve override it without re-running init.
+    STRATA_API_KEY: "${STRATA_API_KEY:-}"
+    # Preferred over STRATA_API_KEY: a file (a docker secret at /run/secrets/<name>), so the key is
+    # not in the environment, where `docker inspect` shows it.
+    STRATA_API_KEY_FILE: "${STRATA_API_KEY_FILE:-}"
   # The expert arena (50 GB for IQ3_S) is pinned with cudaHostRegister, which is charged against
   # RLIMIT_MEMLOCK.  Without this the pinning silently fails and every copy to the GPU crawls.
   ulimits:

@@ -17,9 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Resolved by the host driver through nvidia-container-toolkit, never present at build time, so ldd
+# reporting them missing here means nothing.
+DRIVER_LIBS = ("libcuda.so", "libnvidia-")
 
 failures: list[str] = []
 checks = 0
@@ -63,6 +68,8 @@ def main() -> int:
         check(hasattr(S, name), f"setup.{name} exists", "docker/write_build_json.py, docker/write_pip_stamp.py")
     for name in ("source_hash", "source_version", "pip_install"):
         check(callable(getattr(S, name, None)), f"setup.{name}() exists", "docker/write_build_json.py")
+    check(callable(getattr(S, "cuda_lib_dirs", None)), "setup.cuda_lib_dirs() exists",
+          "the shared-library check below, and the generated config's lib_dirs")
 
     # ---- the engine we compiled matches the tree we shipped --------------------------------------
     meta_path = ROOT / "engine" / "BUILD.json"
@@ -85,6 +92,31 @@ def main() -> int:
             p = ROOT / "engine" / exe
             check(p.is_file() and os.access(p, os.X_OK), f"engine/{exe} is present and executable",
                   "docker/entrypoint.sh")
+
+        # Every shared library must resolve with the search path the server will give the binaries, or the
+        # process dies at exec before printing anything.  server.py hides the vision encoder's stderr in the
+        # engine log, so at run time that shows up only as an empty "the vision encoder did not start:".
+        # This is how libnccl.so.2 - linked by ggml-cuda, not shipped by NVIDIA's pip wheels - got missed.
+        lib_dirs = S.cuda_lib_dirs()
+        check(bool(lib_dirs), "cuda_lib_dirs() finds NVIDIA's pip wheels",
+              "the generated config's lib_dirs, hence LD_LIBRARY_PATH for the engine and the encoder")
+        env = dict(os.environ)
+        if lib_dirs:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                lib_dirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
+        if shutil.which("ldd") is None:
+            print("  [--] ldd is not available - shared library check skipped")
+        else:
+            for exe in ("strata", "strata-vision"):
+                p = ROOT / "engine" / exe
+                if not p.is_file():
+                    continue
+                r = subprocess.run(["ldd", str(p)], capture_output=True, text=True, env=env, timeout=120)
+                missing = [ln.strip() for ln in r.stdout.splitlines()
+                           if "not found" in ln and not any(d in ln for d in DRIVER_LIBS)]
+                check(not missing, f"engine/{exe}: every shared library resolves",
+                      "the binary would die at exec, before it can report anything",
+                      "; ".join(missing))
 
     # the pip stamp only exists in the image's venv
     if not a.no_engine:
