@@ -1,0 +1,4 @@
+# Docker: the image is built on Linux; CRLF in the entrypoint is a "bad interpreter" error there
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+docker/** text eol=lf

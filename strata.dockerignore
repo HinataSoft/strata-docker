@@ -1,0 +1,18 @@
+# Filters the "strata" named build context (the Strata checkout).  BuildKit looks for
+# <context-name>.dockerignore in the MAIN context, which is why this lives here and not in the checkout.
+.git
+.github
+.venv
+engine/
+build*/
+third_party/llama.cpp
+bench/
+docs/
+ref/
+data/experimental-speed-projection/*.gguf
+*.log
+strata-*.json
+run-*.sh
+run-*.bat
+**/__pycache__/
+**/*.pyc

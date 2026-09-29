@@ -1,0 +1,12 @@
+# The main build context is this repository: only docker/ is ever copied from it.
+# The Strata tree arrives as the named context "strata" and is filtered by strata.dockerignore.
+.git
+.gitignore
+.gitattributes
+.env
+README.md
+src/
+strata-data/
+strata-config/
+**/__pycache__/
+**/*.pyc

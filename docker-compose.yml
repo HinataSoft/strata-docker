@@ -1,0 +1,93 @@
+# Strata: one-time init, then a long-running server.
+#
+#   docker compose build
+#   docker compose --profile init run --rm strata-init     once (downloads ~92 GB, builds the pack and MTP)
+#   docker compose up -d strata                            every time after that
+#   docker compose logs -f strata
+#
+# The Strata sources come in as the named build context "strata" - a local checkout during development, a
+# pinned git URL for a real deployment.  Nothing in this repository is copied into the Strata tree.
+#
+# The two main services share one image and one config volume.  They differ in how /data is mounted: init
+# needs it read-write, the server never writes to it (the engine's only file writes are its --dump-* debug
+# flags), so it runs with :ro.
+
+x-strata-common: &strata-common
+  image: strata:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+    additional_contexts:
+      # Where Strata comes from - set in .env, which is the ONLY place the version is pinned.  Normally a
+      # git URL, so the build fetches it and there is nothing to clone by hand; a local path such as ./src
+      # builds a modified checkout instead.  Pin a TAG OR COMMIT, never a branch: a branch would build
+      # something different every time without invalidating anything you can see.
+      strata: "${STRATA_SRC:?set STRATA_SRC in .env (cp .env.example .env)}"
+    args:
+      # 120 = RTX 50 (5060 Ti).  Use "86;120" to also cover the RTX 3060.
+      CUDA_ARCHITECTURES: "${CUDA_ARCHITECTURES:-120}"
+      # ON = ggml built for an AVX2 baseline: the image runs on any AVX2 CPU.
+      # OFF = ggml built with -march=native.  Better tuning for this exact CPU, but the image then ONLY runs
+      #       on it - anywhere else the engine dies with SIGILL.  Safe when you build on the target machine.
+      STRATA_PORTABLE: "${STRATA_PORTABLE:-ON}"
+      # recorded on the image as org.strata.source-ref, so a running container says what it was built from
+      STRATA_REF: "${STRATA_SRC}"
+  environment:
+    STRATA_FAMILY: "${STRATA_FAMILY:-qwen}"
+    STRATA_MODEL: "${STRATA_MODEL:-IQ3_S}"
+    STRATA_CONTEXT: "${STRATA_CONTEXT:-262144}"
+    STRATA_KV: "${STRATA_KV:-int8}"
+    STRATA_VISION: "${STRATA_VISION:-gpu}"
+    STRATA_PORT: "${STRATA_PORT:-8080}"
+    STRATA_PROMPT_CACHE: "${STRATA_PROMPT_CACHE:-24}"
+    STRATA_PROMPT_CACHE_EVERY: "${STRATA_PROMPT_CACHE_EVERY:-8192}"
+  # The expert arena (50 GB for IQ3_S) is pinned with cudaHostRegister, which is charged against
+  # RLIMIT_MEMLOCK.  Without this the pinning silently fails and every copy to the GPU crawls.
+  ulimits:
+    memlock: -1
+    nofile: 65536
+  deploy:
+    resources:
+      reservations:
+        devices:
+          # One card keeps the numbering stable: inside the container it is always GPU 0, so the generated
+          # config needs no --gpu.  `nvidia-smi -L` on the host prints the UUIDs; a GPU-<uuid> here survives
+          # a reboot reordering the PCI indices, which a bare "0" does not.
+          - driver: nvidia
+            device_ids: ["${STRATA_GPU_DEVICE:-0}"]
+            capabilities: [gpu, utility]
+
+services:
+
+  # ---- one-time install: /data read-write ----------------------------------------------------------
+  strata-init:
+    <<: *strata-common
+    profiles: ["init"]
+    command: ["init"]
+    volumes:
+      - "${STRATA_DATA_DIR:-./strata-data}:/data"
+      - "${STRATA_CONFIG_VOLUME:-./strata-config}:/config"
+
+  # ---- the server: /data read-only -----------------------------------------------------------------
+  strata:
+    <<: *strata-common
+    container_name: strata
+    command: ["serve"]
+    restart: unless-stopped
+    volumes:
+      - "${STRATA_DATA_DIR:-./strata-data}:/data:ro"
+      - "${STRATA_CONFIG_VOLUME:-./strata-config}:/config"
+    ports:
+      # No API key is set, so do NOT publish this on a public interface.  Bind it to the LAN address you
+      # want it reachable on, e.g. STRATA_BIND=192.168.1.10 - "0.0.0.0" exposes it on every interface.
+      - "${STRATA_BIND:-127.0.0.1}:${STRATA_PORT:-8080}:${STRATA_PORT:-8080}"
+    stop_grace_period: 30s
+
+  # ---- optional: measure this machine's engine settings (5-10 min) and save them into the config ----
+  strata-calibrate:
+    <<: *strata-common
+    profiles: ["calibrate"]
+    command: ["calibrate"]
+    volumes:
+      - "${STRATA_DATA_DIR:-./strata-data}:/data:ro"
+      - "${STRATA_CONFIG_VOLUME:-./strata-config}:/config"

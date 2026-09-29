@@ -1,0 +1,14 @@
+# An optional local Strata checkout, used only when building a modified Strata (STRATA_SRC=./src).
+# The default build fetches Strata from a pinned tag instead, so this is usually absent.
+# Tracking it here would make it a gitlink with no .gitmodules; the version belongs in .env.
+/src/
+
+# The volumes compose creates with the default paths
+strata-data/
+strata-config/
+
+# Local settings; .env.example is the tracked template
+.env
+
+__pycache__/
+*.pyc
